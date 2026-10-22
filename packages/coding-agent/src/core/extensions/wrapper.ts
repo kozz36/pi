@@ -5,7 +5,7 @@
  * Tool call and tool result interception is handled by AgentSession via agent-core hooks.
  */
 
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { type AgentTool, bindToolExecutionContext, type ToolExecutionContext } from "@earendil-works/pi-agent-core";
 import { wrapToolDefinition } from "../tools/tool-definition-wrapper.ts";
 import type { ExtensionRunner } from "./runner.ts";
 import type { RegisteredTool } from "./types.ts";
@@ -14,10 +14,21 @@ import type { RegisteredTool } from "./types.ts";
  * Wrap a RegisteredTool into an AgentTool.
  * Uses the runner's createToolContext() for consistent context across tools and event handlers.
  */
-export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
-	return wrapToolDefinition(registeredTool.definition, (toolCallId, signal) =>
-		runner.createToolContext(toolCallId, signal),
-	);
+export function wrapRegisteredTool(
+	registeredTool: RegisteredTool,
+	runner: Pick<ExtensionRunner, "createToolContext">,
+): AgentTool {
+	const definition = registeredTool.definition;
+	const tool = wrapToolDefinition(definition, (toolCallId, signal) => runner.createToolContext(toolCallId, signal));
+	const delegate = tool.execute;
+	const execute: AgentTool["execute"] = async (toolCallId, params, signal, onUpdate, context?: ToolExecutionContext) => {
+		context?.assertValid(execute);
+		return context
+			? delegate.call(tool, toolCallId, params, signal, onUpdate, context)
+			: delegate.call(tool, toolCallId, params, signal, onUpdate);
+	};
+	bindToolExecutionContext(execute, delegate, () => registeredTool.definition === definition && tool.execute === delegate);
+	return { ...tool, execute };
 }
 
 /**

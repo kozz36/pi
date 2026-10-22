@@ -119,8 +119,9 @@ See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tool
 
 ## Agent-core invocation primitives
 
-`@earendil-works/pi-agent-core` exports `registerToolExecutionContext`,
-`bindToolExecutionContext`, `isToolExecutionContext`, and the
+Both `@earendil-works/pi-agent-core` and `@earendil-works/pi-coding-agent`
+export `registerToolExecutionContext`, `bindToolExecutionContext`,
+`isToolExecutionContext`, and the
 `ToolExecutionAdmission`, `ToolExecutionContext`, and `ToolExecutionDecision` types.
 These are privileged native-backend primitives, not a sandbox against extensions
 that run in the same process (see [Extensions](extensions.md)).
@@ -138,15 +139,32 @@ is absent, and rechecks validity after asynchronous policy evaluation and approv
 It permits only one attempt, including denied or pending attempts. Closing a
 context invalidates it. A native scope carrier must isolate asynchronous work,
 clear its context on legacy entry, and restore the caller on return or throw.
-The existing `AgentTool.execute` signature is unchanged.
+`AgentTool.execute(id, args, signal, onUpdate, context?)` accepts the native
+invocation context as its optional fifth argument. `ToolDefinition.execute`
+retains the existing extension context in argument five and receives the native
+context separately in optional argument six. These contexts are not interchangeable.
+The core type also retains an explicit four-argument legacy overload. A tool
+returned by the definition-wrapping factories can be registered directly as a
+definition: its wrapper recognizes both native-fifth and extension-fifth/native-sixth
+entry shapes without replacing the extension context.
 
-**Integration limit:** this unit adds primitives and ABI declarations only.
-`BeforeToolCallResult.admission` is declared but the dispatcher does not yet enforce
-it or create, forward, finish, or close invocation contexts. Built-in Bash,
-extension wrappers, live session owners, and OS-start acknowledgements are not yet
-connected. The optional fifth-argument invocation ABI is deferred until coherent
-wrapper integration. Do not use this declaration alone as an execution guard or treat these
-exports as end-to-end admission or background-job support.
+Definition/core bridges and registered-extension wrappers bind their actual
+forwarding functions to captured delegates. They preserve the original tool
+receiver, reject replaced delegates on guarded calls, and do not transfer authority
+through copied tool properties. Calls carrying a native capability stay pinned to
+the captured delegate and reject stale contexts; they never fall back to legacy
+execution. Unguarded legacy calls instead resolve the owner's current `execute`
+method, preserving hot replacement and its receiver. Legacy core calls still
+receive four arguments; legacy definitions still receive five. Context factories
+run only when execution needs an extension context, and existing getters remain
+lazy and current.
+
+**Integration limit:** the dispatcher still calls tools with four arguments.
+`BeforeToolCallResult.admission` is declared but not yet enforced; the dispatcher
+does not create, forward, finish, or close invocation contexts. Built-in Bash final
+admission, live session-owner resolution, and OS-start acknowledgements remain
+unconnected. The bridges are not end-to-end admission, Shellguard enforcement,
+or background-job publication support.
 
 ## Examples
 

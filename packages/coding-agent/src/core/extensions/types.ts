@@ -15,6 +15,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
+	ToolExecutionContext,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type {
@@ -653,6 +654,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
 		ctx: ExtensionToolContext,
+		/** SDK-created final-admission capability, separate from the extension UI context. */
+		context?: ToolExecutionContext,
 	): Promise<AgentToolResult<TDetails>>;
 
 	/** Custom rendering for tool call display */

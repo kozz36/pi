@@ -15,7 +15,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
-import type { ToolExecutionAdmission } from "./tool-execution-context.ts";
+import type { ToolExecutionAdmission, ToolExecutionContext } from "./tool-execution-context.ts";
 
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
@@ -483,12 +483,23 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * Execute the tool call. Throw on failure, or return a result with `isError: true`; do not only
 	 * describe the failure in `content`.
 	 */
-	execute: (
-		toolCallId: string,
-		params: Static<TParameters>,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<TDetails>,
-	) => Promise<AgentToolResult<TDetails>>;
+	execute: {
+		/** Legacy call without a native invocation capability. */
+		(
+			toolCallId: string,
+			params: Static<TParameters>,
+			signal?: AbortSignal,
+			onUpdate?: AgentToolUpdateCallback<TDetails>,
+		): Promise<AgentToolResult<TDetails>>;
+		/** SDK-created invocation capability; never model arguments or extension UI context. */
+		(
+			toolCallId: string,
+			params: Static<TParameters>,
+			signal?: AbortSignal,
+			onUpdate?: AgentToolUpdateCallback<TDetails>,
+			context?: ToolExecutionContext,
+		): Promise<AgentToolResult<TDetails>>;
+	};
 	/** Recovery policy for an effect whose durable intent exists but whose outcome is unknown. */
 	replay?: "never" | "safe";
 	/**

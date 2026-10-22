@@ -1,3 +1,13 @@
+// Native invocation capabilities share agent-core's function binding registry.
+export {
+	bindToolExecutionContext,
+	isToolExecutionContext,
+	registerToolExecutionContext,
+	type ToolExecutionAdmission,
+	type ToolExecutionContext,
+	type ToolExecutionDecision,
+} from "@earendil-works/pi-agent-core";
+
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";

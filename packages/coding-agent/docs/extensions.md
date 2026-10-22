@@ -262,6 +262,23 @@ A tool can run other tools with `ctx.executeTool(name, args, { signal, onUpdate 
 
 See [`hello.ts`](../examples/extensions/hello.ts), [`todo.ts`](../examples/extensions/todo.ts), [`dynamic-tools.ts`](../examples/extensions/dynamic-tools.ts), and [`truncated-tool.ts`](../examples/extensions/truncated-tool.ts).
 
+#### Native invocation context
+
+`ToolDefinition.execute(id, args, signal, onUpdate, ctx, context?)` keeps the
+extension UI/session context in argument five. The optional sixth argument is a
+separate SDK-created `ToolExecutionContext`, not UI context or model input.
+Definition/core bridges forward it along exact captured executor bindings and
+preserve method receivers. Existing context factories and getters remain lazy;
+wrapping a tool does not read or snapshot its UI availability.
+
+Native backends must await final admission before effects. Copying properties from
+a registered executor does not grant its capability, and replacing its delegate
+invalidates guarded invocations. See [SDK invocation primitives](sdk.md#agent-core-invocation-primitives).
+
+The dispatcher does not yet supply this capability. These wrapper contracts do
+not enable built-in Bash admission, live registry-owner policy, OS-start
+acknowledgements, or background-job publication.
+
 ### Tool exposure
 
 `exposure` controls how the model reaches a tool. "Callable" means callable from other tools through `ctx.executeTool()` (`ctx.tools`), as the `codemode` tool's scripts do:
