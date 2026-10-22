@@ -15,6 +15,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
+import type { ToolExecutionAdmission } from "./tool-execution-context.ts";
 
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
@@ -64,6 +65,8 @@ export type AgentToolCall = Extract<AssistantMessage["content"][number], { type:
  * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
  */
 export interface BeforeToolCallResult {
+	/** Require final, executor-bound admission. Dispatcher integration is not yet implemented. */
+	admission?: ToolExecutionAdmission;
 	block?: boolean;
 	reason?: string;
 	/**

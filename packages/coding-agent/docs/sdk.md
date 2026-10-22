@@ -117,6 +117,37 @@ The CLI loads `codemode`, `tool_search`, and MCP as built-in extensions. SDK ses
 
 See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tools](../examples/sdk/05-tools.ts), [extensions](../examples/sdk/06-extensions.ts), and [full control](../examples/sdk/12-full-control.ts).
 
+## Agent-core invocation primitives
+
+`@earendil-works/pi-agent-core` exports `registerToolExecutionContext`,
+`bindToolExecutionContext`, `isToolExecutionContext`, and the
+`ToolExecutionAdmission`, `ToolExecutionContext`, and `ToolExecutionDecision` types.
+These are privileged native-backend primitives, not a sandbox against extensions
+that run in the same process (see [Extensions](extensions.md)).
+
+Registration identifies the actual executor function. A forwarding function must
+be bound to its exact registered delegate with a live owner-validity callback;
+copied properties, tool names, and call IDs do not transfer that capability.
+Re-registering a delegate invalidates existing bindings and invocation contexts.
+
+A context is created internally for one invocation and recognized with
+`isToolExecutionContext()`. A native backend must await
+`context.admit(finalPlan, presentationContext, canConfirm)` at the final effect
+boundary. Admission evaluates that plan, defaults to confirmation when `evaluate`
+is absent, and rechecks validity after asynchronous policy evaluation and approval.
+It permits only one attempt, including denied or pending attempts. Closing a
+context invalidates it. A native scope carrier must isolate asynchronous work,
+clear its context on legacy entry, and restore the caller on return or throw.
+The existing `AgentTool.execute` signature is unchanged.
+
+**Integration limit:** this unit adds primitives and ABI declarations only.
+`BeforeToolCallResult.admission` is declared but the dispatcher does not yet enforce
+it or create, forward, finish, or close invocation contexts. Built-in Bash,
+extension wrappers, live session owners, and OS-start acknowledgements are not yet
+connected. The optional fifth-argument invocation ABI is deferred until coherent
+wrapper integration. Do not use this declaration alone as an execution guard or treat these
+exports as end-to-end admission or background-job support.
+
 ## Examples
 
 | Example | Purpose |
