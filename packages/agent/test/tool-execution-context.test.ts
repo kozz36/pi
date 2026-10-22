@@ -1,8 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { expect, it, vi } from "vitest";
 import {
+	Agent,
+	runToolCall,
+	runAgentLoop,
 	bindToolExecutionContext,
+	type AgentEvent,
+	type AgentOptions,
+	type AgentLoopConfig,
+	type BeforeToolCallContext,
 	isToolExecutionContext,
 	registerToolExecutionContext,
 	type AgentTool,
@@ -231,4 +239,340 @@ it("retains legacy four-argument tools and their receiver without requiring cont
 		},
 	};
 	expect((await tool.execute("same", {}, undefined, undefined)).content).toEqual([{ type: "text", text: "same" }]);
+});
+
+const lifecycleResult = { content: [{ type: "text" as const, text: "done" }], details: undefined };
+function lifecycleMessage(names: string[]): AssistantMessage {
+	return {
+		role: "assistant", content: names.map((name) => ({ type: "toolCall", id: "reused", name, arguments: {} })),
+		api: "openai-responses", provider: "openai", model: "fixture", stopReason: "toolUse", timestamp: 0,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	};
+}
+function lifecycleAgent(tools: AgentTool[], options: Partial<AgentOptions> = {}, names = tools.map((tool) => tool.name)) {
+	const events: AgentEvent[] = [];
+	const agent = new Agent({
+		initialState: { tools },
+		streamFn: () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message: lifecycleMessage(names) }));
+			return stream;
+		},
+		finishTurn: () => ({ action: "end" }),
+		...options,
+	});
+	agent.subscribe((event) => { events.push(event); });
+	return { agent, events };
+}
+function lifecycleTool(
+	execute: (this: AgentTool, ...args: Parameters<AgentTool["execute"]>) => ReturnType<AgentTool["execute"]>,
+	name = "native",
+): AgentTool {
+	return { name, label: name, description: "fixture", parameters: Type.Object({}), execute };
+}
+function executionEnds(events: AgentEvent[]) {
+	return events.filter((event) => event.type === "tool_execution_end");
+}
+
+it("public Agent rejects unsupported admission before executor or policy effects", async () => {
+	const execute = vi.fn(async () => lifecycleResult);
+	const evaluate = vi.fn(() => "allow" as const);
+	const approve = vi.fn(async () => true);
+	const { agent, events } = lifecycleAgent([lifecycleTool(execute)], {
+		beforeToolCall: async () => ({ admission: { isValid: () => true, evaluate, approve } }),
+	});
+	await agent.prompt("fixture");
+	expect(execute).not.toHaveBeenCalled();
+	expect(evaluate).not.toHaveBeenCalled();
+	expect(approve).not.toHaveBeenCalled();
+	expect(executionEnds(events)[0]).toMatchObject({ isError: true,
+		result: { content: [{ type: "text", text: "Executor does not support final admission" }] } });
+});
+
+it.each(["allow", "deny", "confirm"] as const)("public Agent awaits %s on the actual fifth context and closes it", async (decision) => {
+	let effects = 0;
+	let captured: ToolExecutionContext | undefined;
+	const approve = vi.fn(async () => true);
+	const tool = lifecycleTool(async function (_id, _args, _signal, update, context) {
+		expect(this).toBe(tool);
+		expect(arguments.length).toBe(5);
+		expect(isToolExecutionContext(context)).toBe(true);
+		captured = context;
+		await context!.admit({ final: true });
+		effects++;
+		update?.(lifecycleResult);
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const { agent, events } = lifecycleAgent([tool], {
+		beforeToolCall: async () => ({ admission: { isValid: () => true, evaluate: () => decision, approve } }),
+	});
+	await agent.prompt("fixture");
+	expect(effects).toBe(decision === "deny" ? 0 : 1);
+	expect(approve).toHaveBeenCalledTimes(decision === "confirm" ? 1 : 0);
+	expect(executionEnds(events)[0].isError).toBe(decision === "deny");
+	expect(() => captured!.assertValid()).toThrow("stale");
+	expect(events.filter((event) => event.type === "tool_execution_update")).toHaveLength(decision === "deny" ? 0 : 1);
+});
+
+it("public Agent gives hard blocks precedence over unsupported admission", async () => {
+	const execute = vi.fn(async () => lifecycleResult);
+	const evaluate = vi.fn(() => "allow" as const);
+	const { agent, events } = lifecycleAgent([lifecycleTool(execute)], {
+		beforeToolCall: async () => ({ block: true, reason: "host block", terminate: true,
+			admission: { isValid: () => true, evaluate, approve: async () => true } }),
+	});
+	await agent.prompt("fixture");
+	expect(execute).not.toHaveBeenCalled();
+	expect(evaluate).not.toHaveBeenCalled();
+	expect(executionEnds(events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "host block" }], terminate: true } });
+});
+
+it.each(["abort", "owner", "executor", "policy", "deny"])("public Agent prevents effects after %s during approval", async (change) => {
+	let effects = 0;
+	let valid = true;
+	let agent: Agent;
+	const policy = new ReceiverPolicy();
+	policy.denied = false;
+	policy.requiresConfirmation = true;
+	policy.isValid = () => valid;
+	policy.approve = async function () {
+		expect(this).toBe(policy);
+		await Promise.resolve();
+		if (change === "abort") agent.abort();
+		if (change === "owner") agent.state.tools = [{ ...tool }];
+		if (change === "executor") tool.execute = async () => lifecycleResult;
+		if (change === "policy") valid = false;
+		return change !== "deny";
+	};
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		await context!.admit({});
+		effects++;
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const fixture = lifecycleAgent([tool], { beforeToolCall: async () => ({ admission: policy }) });
+	agent = fixture.agent;
+	await agent.prompt("fixture");
+	expect(effects).toBe(0);
+	expect(executionEnds(fixture.events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: change === "deny" ? "Tool execution admission denied" : "Tool execution admission is stale or cancelled" }] } });
+});
+
+it("public Agent closes missing admission and outstanding approval when execute returns", async () => {
+	let release!: (approved: boolean) => void;
+	let pending!: Promise<void>;
+	let effects = 0;
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		pending = context!.admit({}).then(() => { effects++; });
+		// Attach a rejection handler before the intentionally unawaited approval settles.
+		void pending.catch(() => {});
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const { agent, events } = lifecycleAgent([tool], { beforeToolCall: async () => ({ admission: {
+		isValid: () => true, approve: () => new Promise((resolve) => { release = resolve; }),
+	} }) });
+	await agent.prompt("fixture");
+	expect(executionEnds(events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "Executor did not request final admission" }] } });
+	release(true);
+	await expect(pending).rejects.toThrow("stale");
+	expect(effects).toBe(0);
+});
+
+it("public Agent isolates parallel reused IDs, clears nested legacy scope and restores after errors", async () => {
+	const carrier = new AsyncLocalStorage<ToolExecutionContext | undefined>();
+	const contexts: ToolExecutionContext[] = [];
+	const legacy = lifecycleTool(async function () {
+		expect(this).toBe(legacy);
+		expect(arguments.length).toBe(4);
+		expect(carrier.getStore()).toBeUndefined();
+		return lifecycleResult;
+	}, "legacy");
+	const tool = lifecycleTool(async (_id, _args, signal, _update, context) => {
+		expect(carrier.getStore()).toBe(context);
+		contexts.push(context!);
+		await Promise.resolve();
+		await runToolCall({ type: "toolCall", id: "reused", name: "legacy", arguments: {} }, {
+			tools: [legacy], context: { messages: [], tools: [legacy] }, assistantMessage: lifecycleMessage([]), signal,
+		});
+		expect(carrier.getStore()).toBe(context);
+		await context!.admit({});
+		throw new Error("native fixture failure");
+	});
+	registerToolExecutionContext(tool.execute, () => true, (context, invoke) => carrier.run(context, invoke));
+	const { agent, events } = lifecycleAgent([tool], { beforeToolCall: async () => ({ admission: {
+		isValid: () => true, evaluate: () => "allow", approve: async () => true,
+	} }) }, ["native", "native"]);
+	await agent.prompt("fixture");
+	await agent.prompt("fixture again");
+	expect(new Set(contexts).size).toBe(4);
+	expect(executionEnds(events)).toHaveLength(4);
+	expect(executionEnds(events).every((event) => event.isError)).toBe(true);
+	for (const context of contexts) expect(() => context.assertValid()).toThrow("stale");
+	expect(carrier.getStore()).toBeUndefined();
+});
+
+it("public low-level runToolCall rejects a replaced current callable during approval", async () => {
+	let effects = 0;
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		await context!.admit({});
+		effects++;
+		return lifecycleResult;
+	});
+	const tools = [tool];
+	registerToolExecutionContext(tool.execute, () => true);
+	const outcome = await runToolCall({ type: "toolCall", id: "reused", name: "native", arguments: {} }, {
+		tools, context: { tools, messages: [] }, assistantMessage: lifecycleMessage([]),
+		beforeToolCall: async () => ({ admission: { isValid: () => true, approve: async () => {
+			await Promise.resolve();
+			tools[0] = { ...tool };
+			return true;
+		} } }),
+	});
+	expect(effects).toBe(0);
+	expect(outcome).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "Tool execution admission is stale or cancelled" }] } });
+});
+
+it("public AgentLoop checks the caller's current owner, not only its copied context", async () => {
+	let effects = 0;
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		await context!.admit({});
+		effects++;
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const context = { messages: [], tools: [tool] };
+	const events: AgentEvent[] = [];
+	await runAgentLoop([], context, {
+		model: new Agent({ streamFn: () => { throw new Error("unused"); } }).state.model,
+		convertToLlm: () => [], finishTurn: () => ({ action: "end" }),
+		beforeToolCall: async () => ({ admission: { isValid: () => true, approve: async () => {
+			await Promise.resolve();
+			context.tools = [{ ...tool }];
+			return true;
+		} } }),
+	}, (event) => { events.push(event); }, undefined, () => {
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message: lifecycleMessage(["native"]) }));
+		return stream;
+	});
+	expect(effects).toBe(0);
+	expect(executionEnds(events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "Tool execution admission is stale or cancelled" }] } });
+});
+
+it("public Agent rejects stale policy before entering a supported executor", async () => {
+	const execute = vi.fn(async () => lifecycleResult);
+	registerToolExecutionContext(execute, () => true);
+	const approve = vi.fn(async () => true);
+	const { agent, events } = lifecycleAgent([lifecycleTool(execute)], {
+		beforeToolCall: async () => ({ admission: { isValid: () => false, approve } }),
+	});
+	await agent.prompt("fixture");
+	expect(execute).not.toHaveBeenCalled();
+	expect(approve).not.toHaveBeenCalled();
+	expect(executionEnds(events)[0].isError).toBe(true);
+});
+
+it("public Agent reports missing admission and closes an unused captured context", async () => {
+	let captured: ToolExecutionContext | undefined;
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		captured = context;
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const { agent, events } = lifecycleAgent([tool], { beforeToolCall: async () => ({ admission: {
+		isValid: () => true, approve: async () => true,
+	} }) });
+	await agent.prompt("fixture");
+	expect(executionEnds(events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "Executor did not request final admission" }] } });
+	await expect(captured!.admit({})).rejects.toThrow("stale");
+});
+
+it("public Agent keeps legacy receiver, four args, hooks, results and late update filtering", async () => {
+	let lateUpdate: (() => void) | undefined;
+	const tool = lifecycleTool(async function (_id, _args, _signal, update) {
+		expect(this).toBe(tool);
+		expect(arguments.length).toBe(4);
+		update?.(lifecycleResult);
+		lateUpdate = () => update?.(lifecycleResult);
+		return { ...lifecycleResult, structuredContent: { original: true }, terminate: true };
+	});
+	const afterToolCall = vi.fn(async () => ({ content: [{ type: "text" as const, text: "hooked" }] }));
+	const { agent, events } = lifecycleAgent([tool], { afterToolCall });
+	await agent.prompt("fixture");
+	lateUpdate!();
+	expect(afterToolCall).toHaveBeenCalledOnce();
+	expect(events.filter((event) => event.type === "tool_execution_update")).toHaveLength(1);
+	expect(executionEnds(events)[0]).toMatchObject({ isError: false,
+		result: { content: [{ type: "text", text: "hooked" }], terminate: true } });
+	expect(executionEnds(events)[0].result.structuredContent).toBeUndefined();
+	expect(events.at(-1)?.type).toBe("agent_end");
+});
+
+it.each([false, true])("public Agent retains original hook identities and their actual shared receiver, dependent=%s", async (dependent) => {
+	let effects = 0;
+	let beforeReceiver: AgentLoopConfig | undefined;
+	let afterReached = false;
+	let beforeSignal: AbortSignal | undefined;
+	const tool = lifecycleTool(async () => { effects++; return lifecycleResult; });
+	async function beforeToolCall(this: AgentLoopConfig, _context: BeforeToolCallContext, signal?: AbortSignal) {
+		beforeReceiver = this;
+		beforeSignal = signal;
+		expect(arguments.length).toBe(2);
+		expect(signal).toBeInstanceOf(AbortSignal);
+		if (dependent && this.model.id !== "unknown") return { block: true };
+		return undefined;
+	}
+	async function afterToolCall(this: AgentLoopConfig, _context: unknown, signal?: AbortSignal) {
+		afterReached = true;
+		expect(arguments.length).toBe(2);
+		expect(signal).toBe(beforeSignal);
+		expect(this).toBe(beforeReceiver);
+		expect(this.beforeToolCall).toBe(beforeToolCall);
+		expect(this.afterToolCall).toBe(afterToolCall);
+		return undefined;
+	}
+	const { agent, events } = lifecycleAgent([tool], { beforeToolCall, afterToolCall });
+	await agent.prompt("fixture");
+	expect(effects).toBe(1);
+	expect(afterReached).toBe(true);
+	expect(beforeReceiver).toBeDefined();
+	expect(beforeReceiver!.beforeToolCall).toBe(beforeToolCall);
+	expect(beforeReceiver!.afterToolCall).toBe(afterToolCall);
+	expect(executionEnds(events)[0]).toMatchObject({ isError: false, result: lifecycleResult });
+});
+
+it.each(["hook", "session"])("public Agent invalidates %s replacement during approval without policy revocation", async (change) => {
+	let effects = 0;
+	let captured: ToolExecutionContext | undefined;
+	let agent: Agent;
+	const tool = lifecycleTool(async (_id, _args, _signal, _update, context) => {
+		captured = context;
+		await context!.admit({});
+		effects++;
+		return lifecycleResult;
+	});
+	registerToolExecutionContext(tool.execute, () => true);
+	const fixture = lifecycleAgent([tool], { beforeToolCall: async () => ({ admission: {
+		isValid: () => true,
+		approve: async () => {
+			await Promise.resolve();
+			if (change === "hook") agent.beforeToolCall = async () => undefined;
+			else agent.sessionId = "replacement";
+			return true;
+		},
+	} }) });
+	agent = fixture.agent;
+	await agent.prompt("fixture");
+	expect(effects).toBe(0);
+	expect(() => captured!.assertValid()).toThrow("stale");
+	expect(executionEnds(fixture.events)[0]).toMatchObject({ isError: true, result: {
+		content: [{ type: "text", text: "Tool execution admission is stale or cancelled" }] } });
 });

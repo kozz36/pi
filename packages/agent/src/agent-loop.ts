@@ -18,7 +18,13 @@ import {
 	toToolDeclaration,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
+import { Agent } from "./agent.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+import {
+	createToolExecutionContext,
+	runInToolExecutionScope,
+	type ToolExecutionAdmission,
+} from "./tool-execution-context.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -109,6 +115,7 @@ export function agentLoopContinue(
 }
 
 export async function runAgentLoop(
+	this: unknown,
 	prompts: AgentMessage[],
 	context: AgentContext,
 	config: AgentLoopConfig,
@@ -130,11 +137,13 @@ export async function runAgentLoop(
 		await emit({ type: "message_end", message });
 	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), context,
+		this instanceof Agent ? this : undefined);
 	return newMessages;
 }
 
 export async function runAgentLoopContinue(
+	this: unknown,
 	context: AgentContext,
 	config: AgentLoopConfig,
 	emit: AgentEventSink,
@@ -155,7 +164,8 @@ export async function runAgentLoopContinue(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), context,
+		this instanceof Agent ? this : undefined);
 	return newMessages;
 }
 
@@ -176,6 +186,8 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	ownerContext: AgentContext,
+	owner?: Agent,
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
@@ -194,6 +206,7 @@ async function runLoop(
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
+					if (nextTurnSnapshot.context) ownerContext = nextTurnSnapshot.context;
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
 					config = {
@@ -234,6 +247,7 @@ async function runLoop(
 				signal,
 			);
 			if (requestUpdate) {
+				if (requestUpdate.context) ownerContext = requestUpdate.context;
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
 					...config,
@@ -276,7 +290,7 @@ async function runLoop(
 				const executedToolBatch =
 					message.stopReason === "length"
 						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
+						: await executeToolCalls(currentContext, message, config, signal, emit, () => ownerContext.tools, owner);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
@@ -521,15 +535,17 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	resolveTools: () => readonly AgentTool[] | undefined,
+	owner?: Agent,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit, resolveTools, owner);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, resolveTools, owner);
 }
 
 type ExecutedToolCallBatch = {
@@ -544,6 +560,8 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	resolveTools: () => readonly AgentTool[] | undefined,
+	owner?: Agent,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
@@ -556,7 +574,7 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal, undefined, resolveTools, owner);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -600,6 +618,8 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	resolveTools: () => readonly AgentTool[] | undefined,
+	owner?: Agent,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
@@ -611,7 +631,7 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal, undefined, resolveTools, owner);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -674,6 +694,9 @@ type PreparedToolCall = {
 	toolCall: AgentToolCall;
 	tool: AgentTool<any>;
 	args: unknown;
+	executor: AgentTool["execute"];
+	admission?: ToolExecutionAdmission;
+	isCurrent: () => boolean;
 };
 
 type ImmediateToolCallOutcome = {
@@ -722,6 +745,8 @@ async function prepareToolCall(
 	config: ToolCallHooks,
 	signal: AbortSignal | undefined,
 	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
+	resolveTools: () => readonly AgentTool[] | undefined = () => currentContext.tools,
+	owner?: Agent,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = tools.find((t) => t.name === toolCall.name);
 	if (!tool) {
@@ -733,6 +758,11 @@ async function prepareToolCall(
 	}
 
 	try {
+		const executor = tool.execute;
+		const sessionId = owner?.sessionId;
+		const beforeToolCall = config.beforeToolCall;
+		const contextOwnsTools = tools === currentContext.tools;
+		let admission: ToolExecutionAdmission | undefined;
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
@@ -763,6 +793,14 @@ async function prepareToolCall(
 					isError: true,
 				};
 			}
+			if (beforeResult?.admission) {
+				const policy = beforeResult.admission;
+				admission = {
+					isValid: policy.isValid.bind(policy),
+					evaluate: policy.evaluate?.bind(policy),
+					approve: policy.approve.bind(policy),
+				};
+			}
 		}
 		if (signal?.aborted) {
 			return {
@@ -776,6 +814,18 @@ async function prepareToolCall(
 			toolCall,
 			tool,
 			args: validatedArgs,
+			executor,
+			admission,
+			isCurrent: () =>
+				tool.execute === executor &&
+				(!owner || (
+					signal !== undefined && owner.signal === signal &&
+					owner.sessionId === sessionId && owner.beforeToolCall === beforeToolCall &&
+					owner.state.tools.find((candidate) => candidate.name === toolCall.name) === tool
+				)) &&
+				resolveTools()?.find((candidate) => candidate.name === toolCall.name) === tool &&
+				tools.find((candidate) => candidate.name === toolCall.name) === tool &&
+				(!contextOwnsTools || currentContext.tools === tools),
 		};
 	} catch (error) {
 		return {
@@ -820,7 +870,7 @@ export interface RunToolCallOptions extends ToolCallHooks {
  */
 export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
 	const { assistantMessage, context, signal } = options;
-	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, options.tools);
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, options.tools, () => options.tools);
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
@@ -838,21 +888,35 @@ async function executePreparedToolCall(
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
 
+	let executionContext: ReturnType<typeof createToolExecutionContext> | undefined;
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
-				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
-			},
+		if (prepared.admission) {
+			executionContext = createToolExecutionContext(
+				prepared.executor,
+				prepared.admission,
+				() => !signal?.aborted && prepared.isCurrent(),
+			);
+		}
+		const update = (partialResult: AgentToolResult<unknown>) => {
+			if (!acceptingUpdates) return;
+			updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+		};
+		// Unguarded calls retain live method lookup and exactly four arguments.
+		const executor = executionContext ? prepared.executor : prepared.tool.execute;
+		const result = await runInToolExecutionScope(executor, executionContext, () =>
+			executionContext
+				? executor.call(prepared.tool, prepared.toolCall.id, prepared.args as never, signal, update, executionContext)
+				: executor.call(prepared.tool, prepared.toolCall.id, prepared.args as never, signal, update),
 		);
+		executionContext?.finish();
+		// Close before awaiting updates: delayed approvals must not outlive execute().
+		executionContext?.close();
 		const durationMs = elapsed();
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
 		return { result, isError: result.isError === true, durationMs };
 	} catch (error) {
+		executionContext?.close();
 		const durationMs = elapsed();
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
@@ -862,6 +926,7 @@ async function executePreparedToolCall(
 			durationMs,
 		};
 	} finally {
+		executionContext?.close();
 		acceptingUpdates = false;
 	}
 }

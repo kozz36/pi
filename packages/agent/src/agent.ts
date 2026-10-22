@@ -443,7 +443,9 @@ export class Agent {
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
-			await runAgentLoop(
+			// Bind the loop's native owner without replacing either public hook.
+			await runAgentLoop.call(
+				this,
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
@@ -456,7 +458,8 @@ export class Agent {
 
 	private async runContinuation(): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
-			await runAgentLoopContinue(
+			await runAgentLoopContinue.call(
+				this,
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
 				(event) => this.processEvents(event),

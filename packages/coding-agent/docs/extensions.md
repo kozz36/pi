@@ -275,9 +275,16 @@ Native backends must await final admission before effects. Copying properties fr
 a registered executor does not grant its capability, and replacing its delegate
 invalidates guarded invocations. See [SDK invocation primitives](sdk.md#agent-core-invocation-primitives).
 
-The dispatcher does not yet supply this capability. These wrapper contracts do
-not enable built-in Bash admission, live registry-owner policy, OS-start
-acknowledgements, or background-job publication.
+When a core `beforeToolCall` hook requires admission, the dispatcher supplies a
+fresh capability to a registered executor and its bound bridges. It finishes and
+closes that capability after execution; pending approvals cannot authorize effects
+after it closes. Hard blocks take precedence, and unsupported executors fail before
+execution. Legacy calls still clear native carriers and keep their existing arguments.
+
+This does not enable built-in Bash final admission, configured/merged session
+registry-owner policy, OS-start acknowledgements, or background-job publication.
+Native registration trusts backend code to await admission before effects; it does
+not sandbox extensions running inside the host process.
 
 ### Tool exposure
 

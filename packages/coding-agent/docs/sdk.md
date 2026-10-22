@@ -159,12 +159,20 @@ receive four arguments; legacy definitions still receive five. Context factories
 run only when execution needs an extension context, and existing getters remain
 lazy and current.
 
-**Integration limit:** the dispatcher still calls tools with four arguments.
-`BeforeToolCallResult.admission` is declared but not yet enforced; the dispatcher
-does not create, forward, finish, or close invocation contexts. Built-in Bash final
-admission, live session-owner resolution, and OS-start acknowledgements remain
-unconnected. The bridges are not end-to-end admission, Shellguard enforcement,
-or background-job publication support.
+The dispatcher enforces `BeforeToolCallResult.admission`: hard blocks win first,
+then an unsupported executor fails before execution or policy evaluation. Guarded
+calls receive a fresh SDK context in argument five, pinned to the selected callable
+and receiver. The backend must await admission before effects; returning without
+admission produces an error. Contexts close on return or failure, including pending
+approvals. Cancellation and replacement of the current Core Agent tool or executor
+invalidate approval. Reused call IDs do not share invocation state. Unguarded calls
+retain four arguments and clear native scope carriers, including nested calls.
+
+**Integration limit:** registration is privileged host code, not a sandbox; a
+backend that ignores admission can still perform effects before the dispatcher
+reports its missing admission. Built-in Bash final admission, configured/merged
+session-registry owner resolution, and OS-start acknowledgements remain unconnected.
+This is not end-to-end Shellguard enforcement or background-job publication support.
 
 ## Examples
 

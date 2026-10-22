@@ -65,7 +65,7 @@ export type AgentToolCall = Extract<AssistantMessage["content"][number], { type:
  * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
  */
 export interface BeforeToolCallResult {
-	/** Require final, executor-bound admission. Dispatcher integration is not yet implemented. */
+	/** Require final, executor-bound admission from a registered native backend. */
 	admission?: ToolExecutionAdmission;
 	block?: boolean;
 	reason?: string;
