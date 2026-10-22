@@ -1,6 +1,6 @@
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join, win32 } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import { getBinDir } from "../config.ts";
 
 export interface ShellConfig {
@@ -41,37 +41,27 @@ function shellPathExists(path: string): boolean {
 }
 
 function findExecutableOnPath(executable: string): string | null {
-	if (process.platform === "win32") {
-		// Windows: use 'where' and check the returned path.
+	const windows = process.platform === "win32";
+	const path = process.env.PATH ?? "";
+	// Match where's current-directory precedence on Windows. Unix searches only
+	// PATH, with empty entries denoting the current directory. Never run a helper:
+	// even executable discovery must not spawn before final tool admission.
+	const directories = windows ? [process.cwd(), ...path.split(";")] : path.split(":");
+	for (const directory of directories) {
+		const candidate = windows
+			? win32.resolve(directory.replace(/^"(.*)"$/, "$1"), executable)
+			: `${directory || "."}/${executable}`;
 		try {
-			const result = spawnSync("where", [executable], {
-				encoding: "utf-8",
-				timeout: 5000,
-				windowsHide: true,
-			});
-			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && shellPathExists(firstMatch)) {
-					return firstMatch;
-				}
+			if (windows) {
+				// Store execution aliases deliberately use access(F_OK), not stat.
+				if (shellPathExists(candidate)) return candidate;
+			} else {
+				accessSync(candidate, constants.X_OK);
+				if (statSync(candidate).isFile()) return candidate;
 			}
 		} catch {
-			// Ignore errors
+			// Missing, inaccessible or non-executable candidates do not stop lookup.
 		}
-		return null;
-	}
-
-	// Unix: Use 'which' and trust its output (handles Termux and special filesystems)
-	try {
-		const result = spawnSync("which", [executable], { encoding: "utf-8", timeout: 5000 });
-		if (result.status === 0 && result.stdout) {
-			const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-			if (firstMatch) {
-				return firstMatch;
-			}
-		}
-	} catch {
-		// Ignore errors
 	}
 	return null;
 }
