@@ -2,7 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, ToolExecutionAdmission } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -1248,6 +1248,7 @@ export class ExtensionRunner {
 
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
 		const ctx = this.createContext();
+		const admissions: ToolExecutionAdmission[] = [];
 		let result: ToolCallEventResult | undefined;
 
 		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
@@ -1259,11 +1260,47 @@ export class ExtensionRunner {
 					if (result.block) {
 						return result;
 					}
+					if (result.admission) {
+						const admission = result.admission;
+						// Pin functions without losing prototype receivers or live policy fields.
+						admissions.push({
+							isValid: admission.isValid.bind(admission),
+							evaluate: admission.evaluate?.bind(admission),
+							approve: admission.approve.bind(admission),
+						});
+					}
 				}
 			}
 		}
 
-		return result;
+		if (!admissions.length) return result;
+		let confirmations: ToolExecutionAdmission[] = [];
+		return {
+			...result,
+			admission: {
+				isValid: () => {
+					this.assertActive();
+					return admissions.every((admission) => admission.isValid());
+				},
+				evaluate: async (plan, presentationContext) => {
+					confirmations = [];
+					for (const admission of admissions) {
+						const decision = admission.evaluate
+							? await admission.evaluate(plan, presentationContext)
+							: "confirm";
+						if (decision === "confirm") confirmations.push(admission);
+						else if (decision !== "allow") return "deny";
+					}
+					return confirmations.length ? "confirm" : "allow";
+				},
+				approve: async (plan, presentationContext) => {
+					for (const admission of confirmations) {
+						if ((await admission.approve(plan, presentationContext)) !== true) return false;
+					}
+					return true;
+				},
+			},
+		};
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {

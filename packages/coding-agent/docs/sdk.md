@@ -180,12 +180,21 @@ without that context can allow a plan but cannot confirm one. Native calls pin t
 actual backend and its operations receiver. Arbitrary custom operations remain
 unsupported for native admission; ordinary calls retain their existing behavior.
 
+`ExtensionRunner.emitToolCall()` composes every handler's optional `admission`
+using the existing Core `ToolExecutionAdmission` contract. Validity is conjunctive;
+any decision other than `allow` or `confirm` denies before approval. Missing
+`evaluate` requires confirmation, and every required confirmer must approve.
+Callbacks retain their original policy receiver and function identity while reading
+live policy fields. A hard block returns immediately without evaluating or approving
+policies. Without admissions, ordinary last-result fields and identity are unchanged.
+A host must pass the runner result to Core `beforeToolCall` to enforce that policy.
+
 **Integration limit:** registration and spawn hooks are privileged host code, not
 a sandbox; a backend that ignores admission can still perform effects before the
-dispatcher reports its missing admission. Policy composition, configured/merged
-session-registry owner resolution, OS-start acknowledgements and process-authority
-retirement remain unconnected. This is not end-to-end Shellguard enforcement or
-background-job publication support.
+dispatcher reports its missing admission. Actual session admission wiring and
+configured/merged session-registry owner resolution, OS-start acknowledgements and
+process-authority retirement remain separate integration work. This is not end-to-end
+Shellguard enforcement or background-job publication support.
 
 ## Examples
 

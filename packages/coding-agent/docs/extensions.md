@@ -290,10 +290,42 @@ fails closed. Plain legacy custom operations are not native-capable merely becau
 they copy properties from a registered function. Legacy calls keep live method
 lookup, receivers and existing arguments.
 
-Policy composition, configured/merged session registry-owner policy, OS-start
+#### Compose final-plan policies
+
+A `tool_call` handler may return `{ admission }` using the existing
+`ToolExecutionAdmission` contract; no additional registration API is needed.
+`ExtensionRunner.emitToolCall()` collects all such policies, even when later
+handlers return ordinary result fields. All validity predicates must remain true.
+Every policy evaluates the final plan unless an earlier policy denies; missing
+`evaluate` means `confirm`. Any other decision denies before any approval prompt.
+Every required confirmer must return exactly `true`; a decline stops execution.
+Callbacks are pinned to their original function and policy receiver, including
+prototype methods, but continue reading live policy state.
+
+For example, in a host that forwards the runner result to Core `beforeToolCall`:
+
+```typescript
+pi.on("tool_call", (event, ctx) => {
+  if (event.toolName !== "bash") return;
+  return {
+    admission: {
+      isValid: () => ctx.isProjectTrusted(),
+      evaluate: () => "confirm" as const,
+      approve: async () => ctx.ui.confirm("Allow final Bash execution?", event.toolName),
+    },
+  };
+});
+```
+
+A hard `{ block: true }` wins immediately: no policy is evaluated or approved and
+later handlers do not run. Other result fields still come from the last nonempty
+handler result. Without admissions, that result object retains its identity.
+
+Composition alone does not wire actual session admission or resolve current
+configured/merged session registry owners. That integration, OS-start
 acknowledgements, process-authority retirement and background-job publication
-remain separate integration work. Native registration and spawn hooks trust host
-code; they do not sandbox extensions running inside the host process.
+remain separate work. Native registration and spawn hooks trust host code; they
+do not sandbox extensions running inside the host process.
 
 ### Tool exposure
 

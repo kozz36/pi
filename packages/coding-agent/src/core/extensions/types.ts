@@ -15,6 +15,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
+	ToolExecutionAdmission as CoreToolExecutionAdmission,
 	ToolExecutionContext,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
@@ -1455,6 +1456,8 @@ export type BeforeProviderRequestEventResult = unknown;
 export type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
 
 export interface ToolCallEventResult {
+	/** Final-plan policy. Every returned admission must permit execution. */
+	admission?: CoreToolExecutionAdmission;
 	/** Block tool execution. To modify arguments, mutate `event.input` in place instead. */
 	block?: boolean;
 	reason?: string;

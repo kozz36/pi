@@ -7,7 +7,13 @@ import { Agent, type AgentEvent, type AgentTool, type ToolExecutionAdmission } f
 import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { TSchema } from "typebox";
 import { beforeEach, expect, it, vi } from "vitest";
-import type { ExtensionToolContext } from "../src/core/extensions/types.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import { ExtensionRunner } from "../src/core/extensions/runner.ts";
+import type { ExtensionFactory, ExtensionToolContext, ToolCallEventResult } from "../src/core/extensions/types.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 import { type BashOperations, createBashTool, createBashToolDefinition, createLocalBashOperations } from "../src/core/tools/bash.ts";
 import { createPowerShellTool } from "../src/core/tools/powershell.ts";
 import { wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.ts";
@@ -273,4 +279,244 @@ it("keeps legacy current-method lookup, receiver, exact options and shared Power
 		expect(outcome).toMatchObject({ isError: true, structuredContent: { output: "out\nerr\n", exit_code: 7 } });
 		expect(initial).not.toHaveBeenCalled();
 	}
+});
+
+// U5: policies originate in actual extension handlers; only Core constructs capabilities.
+async function admissionRunner(factories: ExtensionFactory[]) {
+	const runtime = createExtensionRuntime();
+	const bus = createEventBus();
+	const extensions = await Promise.all(factories.map((factory, index) =>
+		loadExtensionFromFactory(factory, cwd, bus, runtime, `<admission-${index}>`)));
+	return new ExtensionRunner(extensions, runtime, cwd, SessionManager.inMemory(),
+		await createInMemoryModelRegistry(AuthStorage.inMemory()));
+}
+
+class PrototypeAdmission implements ToolExecutionAdmission {
+	valid = true;
+	accepted = true;
+	decision: "allow" | "confirm" | "deny" = "confirm";
+	validations = 0;
+	evaluations = 0;
+	approvals = 0;
+	receivers: object[] = [];
+	plans: unknown[] = [];
+	presentations: unknown[] = [];
+	onApprove: () => void = () => {};
+	isValid() {
+		this.receivers.push(this);
+		this.validations++;
+		return this.valid;
+	}
+	evaluate(plan: unknown, presentation?: unknown) {
+		this.receivers.push(this);
+		this.plans.push(plan);
+		this.presentations.push(presentation);
+		this.evaluations++;
+		return this.decision;
+	}
+	async approve(plan: unknown, presentation?: unknown) {
+		this.receivers.push(this);
+		this.plans.push(plan);
+		this.presentations.push(presentation);
+		this.approvals++;
+		this.onApprove();
+		await Promise.resolve();
+		return this.accepted;
+	}
+}
+
+async function composedFixture(policies: ToolExecutionAdmission[], tail?: ToolCallEventResult) {
+	const runner = await admissionRunner([
+		...policies.map((admission): ExtensionFactory => (pi) => {
+			pi.on("tool_call", () => ({ admission }));
+		}),
+		...(tail ? [(pi => { pi.on("tool_call", () => tail); }) satisfies ExtensionFactory] : []),
+	]);
+	const { tool } = uiTool();
+	const fixture = invoke(tool);
+	fixture.agent.beforeToolCall = ({ toolCall }) => runner.emitToolCall({
+		type: "tool_call", toolCallId: toolCall.id, toolName: toolCall.name, input: toolCall.arguments,
+	});
+	return fixture;
+}
+
+function policyCounts(policy: PrototypeAdmission, evaluations: number, approvals: number) {
+	expect(policy.evaluations).toBe(evaluations);
+	expect(policy.approvals).toBe(approvals);
+	expect(policy.validations).toBeGreaterThan(0);
+	expect(policy.receivers.every((receiver) => receiver === policy)).toBe(true);
+	expect(policy.plans).toHaveLength(evaluations + approvals);
+	for (const plan of policy.plans) {
+		expect(plan).toBe(policy.plans[0]);
+		expect(plan).toMatchObject({ kind: "local-bash", command: "printf changed > sentinel", cwd, timeoutMs: 2000 });
+		expect(Object.isFrozen(plan)).toBe(true);
+	}
+	for (const presentation of policy.presentations) {
+		expect(presentation).toBe(policy.presentations[0]);
+		expect(presentation).toMatchObject({ cwd, hasUI: true });
+	}
+}
+
+it("composes two prototype confirmations before exactly one native execution", async () => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	expect(result(fixture.events)).toMatchObject({ isError: false,
+		result: { structuredContent: { output: "", exit_code: 0 } } });
+	policyCounts(first, 1, 1);
+	policyCounts(second, 1, 1);
+	expect(spawn).toHaveBeenCalledTimes(1);
+	expect(readFileSync(join(cwd, "sentinel"), "utf8")).toBe("changed");
+});
+
+it("requires the second confirmation even after the first approves", async () => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	second.accepted = false;
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	noEffects(fixture.events, "Tool execution admission denied");
+	policyCounts(first, 1, 1);
+	policyCounts(second, 1, 1);
+});
+
+it.each(["deny", "unexpected", undefined, null])("fails closed for an earlier %s before any confirmation", async (decision) => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	// A JS extension can violate the static decision union; runtime must still fail closed.
+	if (decision === "deny") first.decision = "deny";
+	else Object.defineProperty(first, "decision", { value: decision });
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	noEffects(fixture.events, "Final execution policy denied");
+	policyCounts(first, 1, 0);
+	expect(second.approvals).toBe(0);
+});
+
+it("pins prototype callbacks but reads live policy validity during confirmation", async () => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	const replacements = vi.fn(() => true);
+	const runner = await admissionRunner([(pi) => {
+		pi.on("tool_call", () => ({ admission: first }));
+		pi.on("tool_call", () => {
+			first.isValid = replacements;
+			first.evaluate = vi.fn(() => "deny" as const);
+			first.approve = vi.fn(async () => false);
+			return { admission: second };
+		});
+	}]);
+	second.onApprove = () => { first.valid = false; };
+	const { tool } = uiTool();
+	const fixture = invoke(tool);
+	fixture.agent.beforeToolCall = ({ toolCall }) => runner.emitToolCall({
+		type: "tool_call", toolCallId: toolCall.id, toolName: toolCall.name, input: toolCall.arguments,
+	});
+	await fixture.run();
+	noEffects(fixture.events, "Tool execution admission is stale or cancelled");
+	policyCounts(first, 1, 1);
+	policyCounts(second, 1, 1);
+	expect(replacements).not.toHaveBeenCalled();
+	expect(first.evaluate).not.toHaveBeenCalled();
+	expect(first.approve).not.toHaveBeenCalled();
+});
+
+it("requires every live validity predicate, not only the last policy", async () => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	first.valid = false;
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	noEffects(fixture.events, "Tool execution admission is stale or cancelled");
+	expect(first.validations).toBeGreaterThan(0);
+	for (const policy of [first, second]) {
+		expect(policy.evaluations).toBe(0);
+		expect(policy.approvals).toBe(0);
+	}
+});
+
+it("retains earlier admission when the last handler returns ordinary result fields", async () => {
+	const policy = new PrototypeAdmission();
+	policy.decision = "deny";
+	const fixture = await composedFixture([policy], { reason: "ordinary", terminate: false });
+	await fixture.run();
+	noEffects(fixture.events, "Final execution policy denied");
+	policyCounts(policy, 1, 0);
+});
+
+it("treats omitted evaluate as another required confirmation", async () => {
+	const first = new PrototypeAdmission();
+	const approve = vi.fn(async () => false);
+	const second = { isValid: () => true, approve };
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	noEffects(fixture.events, "Tool execution admission denied");
+	policyCounts(first, 1, 1);
+	expect(approve).toHaveBeenCalledTimes(1);
+});
+
+it("preserves hard-block precedence after an earlier admission without policy callbacks", async () => {
+	const policy = new PrototypeAdmission();
+	const fixture = await composedFixture([policy], { block: true, reason: "hard block", terminate: true });
+	await fixture.run();
+	noEffects(fixture.events, "hard block");
+	expect(policy.receivers).toEqual([]);
+});
+
+it("preserves ordinary handler arguments, receiver, result identity and early block", async () => {
+	const last = { reason: "last", terminate: false };
+	const blocked = { block: true, reason: "blocked", terminate: true };
+	const seen: unknown[][] = [];
+	const event = { type: "tool_call" as const, toolCallId: "legacy", toolName: "bash", input: { command: "raw" } };
+	let returned: ToolCallEventResult = last;
+	const later = vi.fn(async () => undefined);
+	const runner = await admissionRunner([(pi) => {
+		pi.on("tool_call", function (this: void, event, context) {
+			seen.push([this, arguments.length, event, context]);
+			Reflect.set(event.input, "command", "mutated");
+			return { reason: "first" };
+		});
+		pi.on("tool_call", (next, context) => {
+			expect(next).toBe(event);
+			expect(next.input).toMatchObject({ command: "mutated" });
+			expect(context).toBe(seen.at(-1)?.[3]);
+			return returned;
+		});
+		pi.on("tool_call", later);
+	}]);
+	expect(await runner.emitToolCall(event)).toBe(last);
+	expect(seen[0].slice(0, 3)).toEqual([undefined, 2, event]);
+	expect(later).toHaveBeenCalledTimes(1);
+	returned = blocked;
+	expect(await runner.emitToolCall(event)).toBe(blocked);
+	expect(later).toHaveBeenCalledTimes(1);
+	const empty = await admissionRunner([(pi) => { pi.on("tool_call", () => undefined); }]);
+	expect(await empty.emitToolCall(event)).toBeUndefined();
+});
+
+it("suppresses pending confirmations when a later policy denies", async () => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	second.decision = "deny";
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	noEffects(fixture.events, "Final execution policy denied");
+	policyCounts(first, 1, 0);
+	policyCounts(second, 1, 0);
+});
+
+it.each(["allow", "confirm"] as const)("composes allow with %s without unnecessary approvals", async (decision) => {
+	const first = new PrototypeAdmission();
+	const second = new PrototypeAdmission();
+	first.decision = "allow";
+	second.decision = decision;
+	const fixture = await composedFixture([first, second]);
+	await fixture.run();
+	expect(result(fixture.events)).toMatchObject({ isError: false,
+		result: { structuredContent: { output: "", exit_code: 0 } } });
+	policyCounts(first, 1, 0);
+	policyCounts(second, 1, decision === "confirm" ? 1 : 0);
+	expect(spawn).toHaveBeenCalledTimes(1);
+	expect(readFileSync(join(cwd, "sentinel"), "utf8")).toBe("changed");
 });
