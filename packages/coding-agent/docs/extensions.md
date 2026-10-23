@@ -326,8 +326,25 @@ merged owner: SDK custom tools override extension registrations, which override
 built-in tools. Replacing a definition with another object sharing its executor
 does not transfer a pending approval. Removing a configured owner, withdrawing a
 callable nested tool or retiring the runner invalidates approval. Unguarded calls
-retain their existing result and live-executor behavior. OS-start acknowledgements,
-process-authority retirement and background-job publication remain separate work.
+retain their existing result and live-executor behavior.
+
+#### Observe actual Bash start
+
+Host-created Bash tools accept `onStarted: () => void | Promise<void>` in their
+options, not in model input. The native backend invokes the original callback once
+with no arguments or receiver on actual OS `spawn`, never on admission, denial or
+startup error. Custom operations receive the same optional callback but need not
+implement it. Omitting it preserves legacy execution-option keys.
+
+Completion awaits the callback, including after a fast child exit. After the child
+wait completes, a pending callback does not retain child-bound abort/timeout
+handlers or shutdown tracking; the earlier output-drain interval is unchanged.
+A throw or rejection fails completion and stops only the still-live owned process tree; it
+does not signal a known-exited child for that failure. Return promptly. The child
+has already started, so callback failure cannot promise zero command effects.
+General process-authority retirement (U8), SDK14 job publication integration and
+full PK delivery remain separate pending work.
+
 Native registration and spawn hooks trust host code; they do not sandbox extensions
 running inside the host process.
 

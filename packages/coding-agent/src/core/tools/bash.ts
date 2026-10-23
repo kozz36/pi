@@ -98,6 +98,8 @@ export interface BashOperations {
 		cwd: string,
 		options: {
 			onData: (data: Buffer) => void;
+			/** Native backend: once on actual OS spawn, never on admission or startup error. */
+			onStarted?: () => void | Promise<void>;
 			signal?: AbortSignal;
 			timeout?: number;
 			env?: NodeJS.ProcessEnv;
@@ -111,7 +113,7 @@ export interface BashOperations {
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
 	const operations: BashOperations = {
-		async exec(command, cwd, { onData, signal, timeout, env, executionContext, presentationContext }) {
+		async exec(command, cwd, { onData, onStarted, signal, timeout, env, executionContext, presentationContext }) {
 			if (localInvocation.getStore() !== executionContext)
 				throw new Error("Missing or mismatched native execution context");
 			if (executionContext) {
@@ -180,7 +182,33 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				if (child.pid) killProcessTree(child.pid);
 			};
 
+			let childWaitReleased = false;
+			const releaseChildWait = () => {
+				if (childWaitReleased) return;
+				childWaitReleased = true;
+				if (child.pid) untrackDetachedChildPid(child.pid);
+				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (signal) signal.removeEventListener("abort", onAbort);
+			};
+			let startNotification: Promise<void> | undefined;
+			let startFailure: { error: unknown } | undefined;
+			const failStartNotification = (error: unknown) => {
+				startFailure = { error };
+				// Callback failure follows OS start. Stop only this still-live child;
+				// general abort/timeout authority retirement is a separate concern.
+				if (child.pid && child.exitCode === null && child.signalCode === null) killProcessTree(child.pid);
+			};
+			const notifyStarted = () => {
+				if (!onStarted) return;
+				try {
+					startNotification = Promise.resolve(onStarted()).catch(failStartNotification);
+				} catch (error) {
+					failStartNotification(error);
+				}
+			};
+
 			try {
+				if (onStarted) child.once("spawn", notifyStarted);
 				// Set timeout if provided.
 				if (timeoutMs !== undefined) {
 					timeoutHandle = setTimeout(() => {
@@ -199,6 +227,14 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
 				const exitCode = await waitForChildProcess(child);
+				// A fast exit must not hide a pending publication failure.
+				if (startNotification) {
+					// Waiting for host publication must not extend the completed
+					// child's abort/timeout or shutdown-signal authority.
+					releaseChildWait();
+					await startNotification;
+				}
+				if (startFailure) throw startFailure.error;
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
@@ -210,9 +246,8 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				const signalCode = child.signalCode;
 				return { exitCode: exitCode ?? (signalCode ? 128 + (osConstants.signals[signalCode] ?? 0) : 1) };
 			} finally {
-				if (child.pid) untrackDetachedChildPid(child.pid);
-				if (timeoutHandle) clearTimeout(timeoutHandle);
-				if (signal) signal.removeEventListener("abort", onAbort);
+				child.removeListener("spawn", notifyStarted);
+				releaseChildWait();
 			}
 		},
 	};
@@ -281,6 +316,10 @@ function resolveSpawnContext(
 }
 
 export interface BashToolOptions {
+	/** Native OS-spawn acknowledgement. Completion waits for it; failure stops the still-live owned process tree.
+	 * Return promptly. Custom operations need not implement this hook. Not a model argument.
+	 */
+	onStarted?: () => void | Promise<void>;
 	/** Custom operations for command execution. Default: local shell */
 	operations?: BashOperations;
 	/** Command prefix prepended to every command (for example shell setup commands) */
@@ -442,8 +481,10 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
+					const onStarted = options?.onStarted;
 					const executionOptions = {
 						onData: handleData,
+						...(onStarted ? { onStarted } : {}),
 						signal,
 						timeout,
 						env: spawnContext.env,

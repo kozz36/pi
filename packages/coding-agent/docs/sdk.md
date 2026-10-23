@@ -195,11 +195,26 @@ Removing or replacing the configured definition, even with the same executor,
 invalidates its pending approval. Runner retirement and session replacement also
 invalidate it. Nested calls retain the session's callable-tool exposure rules.
 
+Hosts can configure `BashToolOptions.onStarted: () => void | Promise<void>`.
+The native backend calls this original function once, without arguments or a
+receiver, on the actual OS `spawn` event—not at admission. Denial and OS startup
+errors never acknowledge start. `BashOperations.exec` receives the same optional
+callback; custom operations need not implement it. It is host configuration, not
+a model argument. With no callback, legacy execution-option keys are unchanged.
+
+Completion waits for the callback, even if the child exits first. Once the child
+wait completes, a pending callback no longer retains child-bound abort/timeout
+handlers or shutdown tracking. This does not change the earlier output-drain interval.
+A synchronous throw or asynchronous rejection fails completion and stops the still-live owned
+process tree; a known-exited child is not signalled for callback failure. Return
+promptly. This is after OS start: it cannot guarantee zero command effects before
+a callback failure.
+
 **Integration limit:** registration and spawn hooks are privileged host code, not
 a sandbox; a backend that ignores admission can still perform effects before the
-dispatcher reports its missing admission. OS-start acknowledgements and
-process-authority retirement remain separate integration work. This is not end-to-end
-Shellguard enforcement or background-job publication support.
+dispatcher reports its missing admission. General process-authority retirement
+(U8), SDK14 background-job integration and full PK delivery remain pending. This is
+not end-to-end Shellguard enforcement or background-job publication support.
 
 ## Examples
 
