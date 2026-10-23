@@ -1,11 +1,16 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import type * as ChildProcess from "node:child_process";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AgentTool, registerToolExecutionContext, type ToolExecutionContext } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool, registerToolExecutionContext, type ToolExecutionAdmission, type ToolExecutionContext } from "@earendil-works/pi-agent-core";
+import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createToolExecutionContext } from "../../agent/src/tool-execution-context.ts";
+import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import type { ExtensionToolContext, ToolDefinition } from "../src/core/extensions/types.ts";
 import { wrapRegisteredTool } from "../src/core/extensions/wrapper.ts";
@@ -20,6 +25,14 @@ import {
 	wrapToolDefinition,
 	wrapToolDefinitions,
 } from "../src/core/tools/tool-definition-wrapper.ts";
+
+import * as outputFiles from "../src/utils/output-files.ts";
+import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+
+vi.mock("child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof ChildProcess>();
+	return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 describe("native tool definition bridges", () => {
 	const parameters = Type.Object({});
@@ -379,6 +392,115 @@ describe("AgentSession dynamic tool registration", () => {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+
+	it.each(["unchanged configured", "unchanged extension", "unchanged base", "remove configured", "replace configured", "replace extension", "retire runner", "replace session", "nested deferred", "remove nested deferred"] as const)(
+		"checks the live session owner during native approval: %s", async (change) => {
+			vi.restoreAllMocks();
+			vi.mocked(spawn).mockClear();
+			const storedOutput = vi.spyOn(outputFiles, "createOutputFileStream");
+			writeFileSync(join(tempDir, "sentinel"), "unchanged");
+			let onApprove = () => {};
+			class Policy implements ToolExecutionAdmission {
+				valid = true;
+				approvals = 0;
+				evaluations = 0;
+				isValid() { expect(this).toBe(policy); return this.valid; }
+				evaluate(plan: unknown, presentation: unknown) {
+					expect(this).toBe(policy);
+					this.evaluations++;
+					expect(plan).toMatchObject({ kind: "local-bash", cwd: tempDir, command });
+					expect(Object.isFrozen(plan)).toBe(true);
+					expect(presentation).toMatchObject({ cwd: tempDir, hasUI: true });
+					return "confirm" as const;
+				}
+				async approve() {
+					expect(this).toBe(policy);
+					this.approvals++;
+					expect(spawn).not.toHaveBeenCalled();
+					await Promise.resolve();
+					onApprove();
+					return true;
+				}
+			}
+			const policy = new Policy();
+			const command = "printf changed > sentinel; printf mark >> executions; printf stdout; printf stderr >&2";
+			const original: AgentTool = createBashTool(tempDir, { exposeSessionEnvironment: false });
+			const nested = change === "nested deferred" || change === "remove nested deferred";
+			const customTools: ToolDefinition[] = change === "replace extension" || change === "unchanged extension" || change === "unchanged base" ? [] : [nested ? { ...original, exposure: "deferred" } : original];
+			if (nested) customTools.push({
+				name: "caller", label: "caller", description: "Call the deferred native backend", parameters: original.parameters,
+				async execute(_id, _args, _signal, _update, ctx) {
+					return (await ctx.executeTool("bash", { command, timeout: 2 })).result;
+				},
+			});
+			let replaceExtension = () => {};
+			const settingsManager = SettingsManager.inMemory();
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: tempDir, agentDir, settingsManager,
+				extensionFactories: [(pi) => {
+					if (change !== "unchanged base") pi.registerTool(change === "replace extension" ? original : { ...original });
+					replaceExtension = () => pi.registerTool({ ...original });
+					pi.on("tool_call", (event) => event.toolName === "bash" ? { admission: policy } : undefined);
+				}],
+			});
+			await resourceLoader.reload();
+			const events: AgentSessionEvent[] = [];
+			const agent = new Agent({
+				streamFn: () => {
+					const stream = createAssistantMessageEventStream();
+					const message: AssistantMessage = {
+						role: "assistant", content: [{ type: "toolCall", id: "owned", name: nested ? "caller" : "bash", arguments: { command, timeout: 2 } }],
+						api: "openai-responses", provider: "openai", model: "fixture", stopReason: "toolUse", timestamp: 0,
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					};
+					queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message }));
+					return stream;
+				},
+				finishTurn: () => ({ action: "end" }),
+			});
+			const session = new AgentSession({
+				agent, cwd: tempDir, settingsManager, resourceLoader, customTools,
+				initialActiveToolNames: nested ? ["caller"] : undefined,
+				sessionManager: SessionManager.inMemory(tempDir),
+				modelRuntime: getModelRuntime(await createInMemoryModelRegistry(AuthStorage.inMemory())),
+			});
+			session.subscribe((event) => { events.push(event); });
+			if (nested) expect(session.getActiveToolNames()).not.toContain("bash");
+			// A public UI host stub; the runner, not the fixture, creates tool contexts.
+			await session.bindExtensions({ uiContext: { ...session.extensionRunner.getUIContext() } });
+			const beforeHook = agent.beforeToolCall;
+			onApprove = () => {
+				if (change === "remove configured" || change === "remove nested deferred") customTools.splice(0, 1);
+				if (change === "replace configured") customTools.splice(0, 1, { ...original });
+				if (change === "replace extension") replaceExtension();
+				if (change === "retire runner") session.extensionRunner.invalidate("retired fixture runner");
+				if (change === "replace session") session.sessionManager.newSession({ id: "replacement" });
+			};
+			try {
+				// Only Core mints invocation capabilities; use the real session-installed hooks.
+				await agent.prompt("Run the owned fixture command");
+				const end = events.find((event) => event.type === "tool_execution_end" && event.toolName === "bash");
+				if (!end || end.type !== "tool_execution_end") throw new Error("missing native result");
+				expect(policy.evaluations).toBe(1);
+				expect(policy.approvals).toBe(1);
+				expect(agent.beforeToolCall).toBe(beforeHook);
+				if (change.startsWith("unchanged") || change === "nested deferred") {
+					expect(end).toMatchObject({ isError: false, result: { structuredContent: { output: "stdoutstderr", exit_code: 0 } } });
+					expect(spawn).toHaveBeenCalledTimes(1);
+					expect(readFileSync(join(tempDir, "sentinel"), "utf8")).toBe("changed");
+					expect(readFileSync(join(tempDir, "executions"), "utf8")).toBe("mark");
+				} else {
+					expect(end).toMatchObject({ isError: true, result: { content: [{ type: "text", text: change === "retire runner" ? "retired fixture runner" : "Tool execution admission is stale or cancelled" }] } });
+					expect(spawn).not.toHaveBeenCalled();
+					expect(storedOutput).not.toHaveBeenCalled();
+					expect(events.filter((event) => event.type === "tool_execution_update")).toEqual([]);
+					expect(readFileSync(join(tempDir, "sentinel"), "utf8")).toBe("unchanged");
+					expect(readdirSync(tempDir).sort()).toEqual(["agent", "sentinel"]);
+				}
+			} finally { session.dispose(); vi.restoreAllMocks(); }
+		},
+	);
 
 	it("exposes session state before custom bash spawn hooks and supports opting out", async () => {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);

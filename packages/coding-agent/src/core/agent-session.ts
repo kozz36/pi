@@ -664,14 +664,40 @@ export class AgentSession {
 			return undefined;
 		}
 
+		const sessionId = this.sessionId;
+		const definition = this._toolDefinitions.get(toolCall.name)?.definition;
+		const baseOwner = this._baseToolsOverride?.[toolCall.name];
 		try {
-			return await runner.emitToolCall({
+			const result = await runner.emitToolCall({
 				type: "tool_call",
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				...(parentToolCallId ? { parentToolCallId } : {}),
 				input: args as Record<string, unknown>,
 			});
+			if (!result?.admission || result.block) return result;
+			const policy = result.admission;
+			const isValid = policy.isValid.bind(policy);
+			return {
+				...result,
+				admission: {
+					isValid: () => {
+						// Use the live configured sources, with the same final precedence as
+						// _refreshToolRegistry; its materialized registry can predate approval.
+						const current = this._customTools.findLast((tool) => tool.name === toolCall.name)
+							?? runner.getToolDefinition(toolCall.name)
+							?? this._baseToolDefinitions.get(toolCall.name);
+						return isValid() && this._extensionRunner === runner && this.sessionId === sessionId && definition !== undefined &&
+							current === definition && this._toolDefinitions.get(toolCall.name)?.definition === definition &&
+							this._isAllowedTool(toolCall.name) &&
+							(definition !== this._baseToolDefinitions.get(toolCall.name) ||
+								this._baseToolsOverride?.[toolCall.name] === baseOwner) &&
+							(!parentToolCallId || this._getCallableTools().some((tool) => tool.name === toolCall.name));
+					},
+					evaluate: policy.evaluate?.bind(policy),
+					approve: policy.approve.bind(policy),
+				},
+			};
 		} catch (err) {
 			if (err instanceof Error) {
 				throw err;

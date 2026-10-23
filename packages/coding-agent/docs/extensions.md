@@ -302,7 +302,7 @@ Every required confirmer must return exactly `true`; a decline stops execution.
 Callbacks are pinned to their original function and policy receiver, including
 prototype methods, but continue reading live policy state.
 
-For example, in a host that forwards the runner result to Core `beforeToolCall`:
+For example, `AgentSession` forwards these results to Core `beforeToolCall`:
 
 ```typescript
 pi.on("tool_call", (event, ctx) => {
@@ -321,11 +321,15 @@ A hard `{ block: true }` wins immediately: no policy is evaluated or approved an
 later handlers do not run. Other result fields still come from the last nonempty
 handler result. Without admissions, that result object retains its identity.
 
-Composition alone does not wire actual session admission or resolve current
-configured/merged session registry owners. That integration, OS-start
-acknowledgements, process-authority retirement and background-job publication
-remain separate work. Native registration and spawn hooks trust host code; they
-do not sandbox extensions running inside the host process.
+During guarded session execution, the original definition must remain the live
+merged owner: SDK custom tools override extension registrations, which override
+built-in tools. Replacing a definition with another object sharing its executor
+does not transfer a pending approval. Removing a configured owner, withdrawing a
+callable nested tool or retiring the runner invalidates approval. Unguarded calls
+retain their existing result and live-executor behavior. OS-start acknowledgements,
+process-authority retirement and background-job publication remain separate work.
+Native registration and spawn hooks trust host code; they do not sandbox extensions
+running inside the host process.
 
 ### Tool exposure
 

@@ -187,12 +187,17 @@ any decision other than `allow` or `confirm` denies before approval. Missing
 Callbacks retain their original policy receiver and function identity while reading
 live policy fields. A hard block returns immediately without evaluating or approving
 policies. Without admissions, ordinary last-result fields and identity are unchanged.
-A host must pass the runner result to Core `beforeToolCall` to enforce that policy.
+`AgentSession` forwards the runner result through its existing Core `beforeToolCall`
+hook. Standalone hosts must forward it themselves. For guarded session calls, the
+selected definition must remain the current merged owner throughout approval:
+SDK custom tools take precedence over extension registrations, then built-in tools.
+Removing or replacing the configured definition, even with the same executor,
+invalidates its pending approval. Runner retirement and session replacement also
+invalidate it. Nested calls retain the session's callable-tool exposure rules.
 
 **Integration limit:** registration and spawn hooks are privileged host code, not
 a sandbox; a backend that ignores admission can still perform effects before the
-dispatcher reports its missing admission. Actual session admission wiring and
-configured/merged session-registry owner resolution, OS-start acknowledgements and
+dispatcher reports its missing admission. OS-start acknowledgements and
 process-authority retirement remain separate integration work. This is not end-to-end
 Shellguard enforcement or background-job publication support.
 
