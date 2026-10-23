@@ -168,11 +168,24 @@ approvals. Cancellation and replacement of the current Core Agent tool or execut
 invalidate approval. Reused call IDs do not share invocation state. Unguarded calls
 retain four arguments and clear native scope carriers, including nested calls.
 
-**Integration limit:** registration is privileged host code, not a sandbox; a
-backend that ignores admission can still perform effects before the dispatcher
-reports its missing admission. Built-in Bash final admission, configured/merged
-session-registry owner resolution, and OS-start acknowledgements remain unconnected.
-This is not end-to-end Shellguard enforcement or background-job publication support.
+Built-in Bash and `createLocalBashOperations()` support final admission. When the
+Core dispatcher requires it, Bash captures the final command, cwd, timeout, shell,
+arguments and argv/stdin transport before awaiting policy. The plan and argument
+array are frozen; environment values are captured privately and are not exposed
+in the policy plan. Execution uses that snapshot once, with a final synchronous
+context check before spawn. Denial, stale ownership, cancellation and declined
+confirmation cause no native spawn, stdin write or stored-output creation.
+Confirmation requires the current extension context's `hasUI`; a plain Agent
+without that context can allow a plan but cannot confirm one. Native calls pin the
+actual backend and its operations receiver. Arbitrary custom operations remain
+unsupported for native admission; ordinary calls retain their existing behavior.
+
+**Integration limit:** registration and spawn hooks are privileged host code, not
+a sandbox; a backend that ignores admission can still perform effects before the
+dispatcher reports its missing admission. Policy composition, configured/merged
+session-registry owner resolution, OS-start acknowledgements and process-authority
+retirement remain unconnected. This is not end-to-end Shellguard enforcement or
+background-job publication support.
 
 ## Examples
 

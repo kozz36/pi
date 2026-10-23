@@ -281,10 +281,19 @@ closes that capability after execution; pending approvals cannot authorize effec
 after it closes. Hard blocks take precedence, and unsupported executors fail before
 execution. Legacy calls still clear native carriers and keep their existing arguments.
 
-This does not enable built-in Bash final admission, configured/merged session
-registry-owner policy, OS-start acknowledgements, or background-job publication.
-Native registration trusts backend code to await admission before effects; it does
-not sandbox extensions running inside the host process.
+Built-in Bash now binds its actual local executor and admits its immutable final
+command/cwd/timeout/shell/argument/transport plan before spawning. Environment
+values are captured privately before approval. It rechecks native validity at the
+synchronous spawn boundary and never falls back to a mutable or raw executor.
+Confirmation requires live `ctx.hasUI`; no extension context means confirmation
+fails closed. Plain legacy custom operations are not native-capable merely because
+they copy properties from a registered function. Legacy calls keep live method
+lookup, receivers and existing arguments.
+
+Policy composition, configured/merged session registry-owner policy, OS-start
+acknowledgements, process-authority retirement and background-job publication
+remain separate integration work. Native registration and spawn hooks trust host
+code; they do not sandbox extensions running inside the host process.
 
 ### Tool exposure
 

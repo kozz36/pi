@@ -1,7 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import {
+	type AgentTool,
+	bindToolExecutionContext,
+	isToolExecutionContext,
+	registerToolExecutionContext,
+	type ToolExecutionContext,
+} from "@earendil-works/pi-agent-core";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { waitForChildProcess } from "../../utils/child-process.ts";
@@ -18,6 +25,11 @@ import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
+
+// Lifecycle evidence only: never recover authority from this carrier.
+const localInvocation = new AsyncLocalStorage<ToolExecutionContext | undefined>();
+const localInvocationScope = <T>(context: ToolExecutionContext | undefined, invoke: () => Promise<T>): Promise<T> =>
+	localInvocation.run(context, invoke);
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
@@ -89,14 +101,24 @@ export interface BashOperations {
 			signal?: AbortSignal;
 			timeout?: number;
 			env?: NodeJS.ProcessEnv;
+			/** SDK-created native admission; arbitrary custom operations are not implicitly supported. */
+			executionContext?: ToolExecutionContext;
+			presentationContext?: ExtensionContext;
 		},
 	) => Promise<{ exitCode: number | null }>;
 }
 
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
-	return {
-		exec: async (command, cwd, { onData, signal, timeout, env }) => {
+	const operations: BashOperations = {
+		async exec(command, cwd, { onData, signal, timeout, env, executionContext, presentationContext }) {
+			if (localInvocation.getStore() !== executionContext)
+				throw new Error("Missing or mismatched native execution context");
+			if (executionContext) {
+				if (!isToolExecutionContext(executionContext)) throw new Error("Expected an SDK tool execution context");
+				executionContext.assertValid(executor);
+				if (this !== operations) throw new Error("Missing or mismatched native execution context");
+			}
 			const timeoutMs = resolveTimeoutMs(timeout);
 			if (signal?.aborted) {
 				throw new Error("aborted");
@@ -109,10 +131,41 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+			let shell = shellConfig.shell;
+			let args: readonly string[] = commandFromStdin ? shellConfig.args : [...shellConfig.args, command];
+			let processEnv = env ?? getShellEnv();
+			if (executionContext) {
+				// Capture the final transport and environment before policy can await.
+				// Environment values stay private; neither retained hook objects nor
+				// mutable shell configuration are consulted again for execution.
+				processEnv = Object.freeze({ ...processEnv });
+				const plan: LocalBashExecutionPlan = Object.freeze({
+					kind: "local-bash",
+					command,
+					cwd,
+					timeoutMs,
+					shell,
+					args: Object.freeze([...args]),
+					commandTransport: commandFromStdin ? "stdin" : "argv",
+				});
+				shell = plan.shell;
+				args = plan.args;
+				const ui = presentationContext?.ui;
+				let requiresUI = false;
+				const canConfirm = () => {
+					requiresUI = true;
+					return presentationContext?.hasUI === true && presentationContext.ui === ui;
+				};
+				await executionContext.admit(plan, presentationContext, canConfirm);
+				if (requiresUI && !canConfirm()) throw new Error("Final admission UI is no longer available");
+				if (signal?.aborted) throw new Error("aborted");
+				// Final synchronous guard; there is no asynchronous work before spawn.
+				executionContext.assertValid(executor);
+			}
+			const child = spawn(shell, args, {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
+				env: processEnv,
 				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
@@ -163,6 +216,19 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 		},
 	};
+	const executor = operations.exec;
+	return operations;
+}
+
+/** Immutable public transport values. Environment values are captured privately. */
+export interface LocalBashExecutionPlan {
+	readonly kind: "local-bash";
+	readonly command: string;
+	readonly cwd: string;
+	readonly timeoutMs: number | undefined;
+	readonly shell: string;
+	readonly args: readonly string[];
+	readonly commandTransport: "stdin" | "argv";
 }
 
 /**
@@ -172,7 +238,10 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
  * standard local shell behavior while wrapping or rewriting commands.
  */
 export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
-	return createLocalShellOperations("bash", () => getShellConfig(options?.shellPath));
+	const operations = createLocalShellOperations("bash", () => getShellConfig(options?.shellPath));
+	const executor = operations.exec;
+	registerToolExecutionContext(executor, () => operations.exec === executor, localInvocationScope);
+	return operations;
 }
 
 export interface BashSpawnContext {
@@ -249,7 +318,12 @@ export function createShellToolDefinition(
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
-	return {
+	// Native bindings need a stable own callable. Do not invoke legacy getters
+	// while constructing a tool; those still resolve only when it executes.
+	const descriptor: TypedPropertyDescriptor<BashOperations["exec"]> | undefined =
+		Object.getOwnPropertyDescriptor(ops, "exec");
+	const backend = descriptor?.value;
+	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: config.name,
 		label: config.label,
 		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
@@ -264,7 +338,14 @@ export function createShellToolDefinition(
 			signal?: AbortSignal,
 			onUpdate?,
 			ctx?: ExtensionContext,
+			context?: ToolExecutionContext,
 		) {
+			if (localInvocation.getStore() !== context)
+				throw new Error("Missing or mismatched native execution context");
+			if (context) {
+				if (!isToolExecutionContext(context)) throw new Error("Expected an SDK tool execution context");
+				context.assertValid(definition.execute);
+			}
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,
@@ -315,7 +396,7 @@ export function createShellToolDefinition(
 				}, delay);
 			};
 
-			if (onUpdate) {
+			if (onUpdate && !context) {
 				onUpdate({ content: [], details: undefined });
 			}
 
@@ -361,13 +442,19 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
-					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
+					const executionOptions = {
 						onData: handleData,
 						signal,
 						timeout,
 						env: spawnContext.env,
-					});
-					exitCode = result.exitCode;
+						...(context ? { executionContext: context, presentationContext: ctx } : {}),
+					};
+					if (context) {
+						if (!backend) throw new Error("Executor does not support final admission");
+						exitCode = (await backend.call(ops, spawnContext.command, spawnContext.cwd, executionOptions)).exitCode;
+					} else {
+						exitCode = (await ops.exec(spawnContext.command, spawnContext.cwd, executionOptions)).exitCode;
+					}
 				} catch (err) {
 					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
@@ -412,6 +499,8 @@ export function createShellToolDefinition(
 		},
 		...createShellRenderers(config.prompt),
 	};
+	if (backend) bindToolExecutionContext(definition.execute, backend, () => ops.exec === backend);
+	return definition;
 }
 
 const bashToolConfig: ShellToolConfig = {
