@@ -1,6 +1,6 @@
 import type * as ChildProcess from "node:child_process";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentTool, bindToolExecutionContext, type ToolExecutionAdmission, type ToolExecutionContext } from "@earendil-works/pi-agent-core";
@@ -244,4 +244,99 @@ it("does not add optional keys or read legacy executor getters until execution w
 	await tool.execute("legacy", { command: "unused" });
 	expect(reads).toBe(1);
 	expect(calls).toEqual([["onData", "signal", "timeout", "env"]]);
+});
+
+it("requireAdmission rejects a direct contextless call before hooks, spawn, acknowledgement or stored effects", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "required-admission-"));
+	const effect = join(cwd, "forbidden-effect");
+	const before = readdirSync(cwd);
+	const started = vi.fn();
+	let hooks = 0;
+	const tool = createBashTool(cwd, {
+		requireAdmission: true,
+		shellPath: "/bin/sh",
+		exposeSessionEnvironment: false,
+		onStarted: started,
+		spawnHook: (context) => { hooks++; return context; },
+	});
+	let result: unknown;
+	let error: unknown;
+	try {
+		result = await tool.execute("direct", {
+			command: `printf forbidden > ${JSON.stringify(effect)}; printf unexpected; printf unexpected-error >&2; exit 7`,
+		});
+	} catch (caught) {
+		error = caught;
+	}
+	expect({
+		error: error instanceof Error ? error.message : error,
+		result,
+		hooks,
+		spawns: vi.mocked(spawn).mock.calls.length,
+		acknowledgements: started.mock.calls,
+		storedFiles: readdirSync(cwd),
+	}).toEqual({
+		error: "Host admission context required",
+		result: undefined,
+		hooks: 0,
+		spawns: 0,
+		acknowledgements: [],
+		storedFiles: before,
+	});
+});
+
+it("requireAdmission accepts a real Core-admitted execution and acknowledges its actual child", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "required-core-admission-"));
+	const started = vi.fn();
+	let hooks = 0;
+	let evaluations = 0;
+	const tool = createBashTool(cwd, {
+		requireAdmission: true,
+		shellPath: "/bin/sh",
+		exposeSessionEnvironment: false,
+		onStarted: started,
+		spawnHook: (context) => { hooks++; return context; },
+	});
+	const result = await invoke(tool, "printf admitted", {
+		...allow,
+		evaluate: () => {
+			evaluations++;
+			expect(started).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+			return "allow";
+		},
+	});
+	expect(result).toMatchObject({
+		isError: false,
+		result: {
+			content: [{ type: "text", text: "admitted" }],
+			structuredContent: { output: "admitted", exit_code: 0, truncated: false },
+		},
+	});
+	expect(evaluations).toBe(1);
+	expect(hooks).toBe(1);
+	expect(spawn).toHaveBeenCalledTimes(1);
+	expect(started).toHaveBeenCalledTimes(1);
+	expect(readdirSync(cwd)).toEqual([]);
+});
+
+it.each([undefined, false])("requireAdmission=%s preserves the direct legacy execution contract", async (requireAdmission) => {
+	const cwd = mkdtempSync(join(tmpdir(), "legacy-direct-admission-"));
+	const started = vi.fn();
+	let hooks = 0;
+	const tool = createBashTool(cwd, {
+		...(requireAdmission === undefined ? {} : { requireAdmission }),
+		shellPath: "/bin/sh",
+		exposeSessionEnvironment: false,
+		onStarted: started,
+		spawnHook: (context) => { hooks++; return context; },
+	});
+	const result = await tool.execute("legacy-direct", { command: "printf legacy" });
+	expect(result.content).toEqual([{ type: "text", text: "legacy" }]);
+	expect(result.structuredContent).toMatchObject({ output: "legacy", exit_code: 0, truncated: false });
+	expect(result).not.toMatchObject({ isError: true });
+	expect(hooks).toBe(1);
+	expect(spawn).toHaveBeenCalledTimes(1);
+	expect(started).toHaveBeenCalledTimes(1);
+	expect(readdirSync(cwd)).toEqual([]);
 });

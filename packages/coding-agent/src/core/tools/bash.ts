@@ -320,6 +320,8 @@ export interface BashToolOptions {
 	 * Return promptly. Custom operations need not implement this hook. Not a model argument.
 	 */
 	onStarted?: () => void | Promise<void>;
+	/** Require admission even for direct calls. Native dispatcher eligibility does not depend on this flag. */
+	requireAdmission?: boolean;
 	/** Custom operations for command execution. Default: local shell */
 	operations?: BashOperations;
 	/** Command prefix prepended to every command (for example shell setup commands) */
@@ -357,6 +359,7 @@ export function createShellToolDefinition(
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
+	const requireAdmission = options?.requireAdmission === true;
 	// Native bindings need a stable own callable. Do not invoke legacy getters
 	// while constructing a tool; those still resolve only when it executes.
 	const descriptor: TypedPropertyDescriptor<BashOperations["exec"]> | undefined =
@@ -381,6 +384,7 @@ export function createShellToolDefinition(
 		) {
 			if (localInvocation.getStore() !== context)
 				throw new Error("Missing or mismatched native execution context");
+			if (requireAdmission && !context) throw new Error("Host admission context required");
 			if (context) {
 				if (!isToolExecutionContext(context)) throw new Error("Expected an SDK tool execution context");
 				context.assertValid(definition.execute);
